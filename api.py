@@ -1,10 +1,21 @@
 import os
+import time
+import asyncio
 import redis.asyncio as redis
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 redis_client: redis.Redis = None
+task_queue = asyncio.Queue()
+
+
+async def task_worker():
+    while True:
+        item = await task_queue.get()
+        print(f"new message: {item}")
+        # await asyncio.sleep(2)
+        task_queue.task_done()
 
 
 @asynccontextmanager
@@ -17,12 +28,29 @@ async def lifespan(app: FastAPI):
     )
     await redis_client.ping()
     await redis_client.set("request_count", 0)
+    asyncio.create_task(task_worker())
+
     yield
     print("ONSHUTDOWN")
     await redis_client.aclose()
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/ping")
+async def read_root():
+    return {"ping": "pong"}
+
+
+@app.get("/info")
+async def read_root():
+    item = await task_queue.put(str(time.time()))
+    return {
+        "code": "1",
+        "instance": os.environ.get("INSTANCE_ID", None),
+        "request_count": int(await redis_client.get("request_count")),
+    }
 
 
 class Payment(BaseModel):
@@ -72,16 +100,3 @@ async def payments_summary():
             "totalAmount": 0,
         }
     }
-
-
-@app.get("/info")
-async def read_root():
-    return {
-        "request_count": await redis_client.get("request_count"),
-        "instance": os.environ.get("INSTANCE_ID", None)
-    }
-
-
-@app.get("/ping")
-async def read_root():
-    return {"ping": "pong"}

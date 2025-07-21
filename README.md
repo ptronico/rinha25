@@ -1,5 +1,7 @@
 # Rinha25 API
 
+https://github.com/zanfranceschi/rinha-de-backend-2025
+
 A FastAPI-based REST API built with Python 3.13.
 
 ## Features
