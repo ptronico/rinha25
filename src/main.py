@@ -49,14 +49,54 @@ class PaymentProcessorHealth:
         self._fallback_failing = is_failing
 
 
-
-utc_dt = datetime.now(timezone.utc)
 redis_client: redis.Redis = None
 
 default_http_client: Type[HttpClient] = HttpClient(base_url="http://payment-processor-default:8080", name="DEFAULT")
 fallback_http_client: Type[HttpClient] = HttpClient(base_url="http://payment-processor-fallback:8080", name="FALLBACK")
-
 payment_processor_health: Type[PaymentProcessorHealth] = PaymentProcessorHealth()
+
+
+class TransactionsDB:
+    _default_db_name = "dtxs"
+    _fallback_db_name = "ftxs"
+
+    @classmethod
+    def _datetime_str_to_number(cls, datetime_str: str) -> int:
+        if "." in datetime_str:
+            dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%S.%fZ")
+        else:
+            dt = datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%S")
+        dt = dt.replace(tzinfo=timezone.utc)
+        value = int(dt.timestamp() * 1000)
+        return value
+
+    @classmethod
+    async def default_add(cls, datetime_str: str, amount: str):
+        await redis_client.zadd(cls._default_db_name, {amount: cls._datetime_str_to_number(datetime_str)})
+
+    @classmethod
+    async def default_summary(cls, start_datetime_str: str, end_datetime_str: str):
+        txs: list = await redis_client.zrangebyscore(
+            cls._default_db_name,
+            cls._datetime_str_to_number(start_datetime_str),
+            cls._datetime_str_to_number(end_datetime_str),
+        )
+        n = len(txs)
+        return (n, n * 19.9)
+
+    @classmethod
+    async def fallback_add(cls, datetime_str: str, amount: str):
+        await redis_client.zadd(cls._fallback_db_name, {amount: cls._datetime_str_to_number(datetime_str)})
+
+    @classmethod
+    async def fallback_summary(cls, start_datetime_str: str, end_datetime_str: str):
+        txs: list = await redis_client.zrangebyscore(
+            cls._fallback_db_name,
+            cls._datetime_str_to_number(start_datetime_str),
+            cls._datetime_str_to_number(end_datetime_str),
+        )
+        n = len(txs)
+        return (n, n * 19.9)
 
 
 class Cache:
@@ -171,17 +211,16 @@ async def task_worker(idx: int):
     logging.warning(f"Starting queue {idx}")
     while True:
         message = await Queue.pop()
-        now = utc_dt.strftime("%Y-%m-%dT%H:%M:%S")
-        data = json.loads(message) | {"requestedAt": f"{now}.000Z"}
-
+        data = json.loads(message)
         if not payment_processor_health.default_failing:
             try:
                 response = await default_http_client.post(endpoint="/payments", payload=data)
                 await Cache.incr_total_amount(query_default=True, amount=data["amount"])
                 await Cache.incr_total_requests(query_default=True, requests=1)
+                await TransactionsDB.default_add(datetime_str=data["requestedAt"], amount=message)
                 continue
             except httpx.HTTPStatusError as e:
-                # logging.error(f"[httpx.HTTPStatusError] {e}")
+                logging.error(f"[httpx.HTTPStatusError] DEFAULT Error 500 -- lost message")
                 payment_processor_health.default_failing = True
             except Exception as e:
                 logging.error(f"[Exception] {e}")
@@ -193,9 +232,10 @@ async def task_worker(idx: int):
                 response = await fallback_http_client.post(endpoint="/payments", payload=data)
                 await Cache.incr_total_amount(query_default=False, amount=data["amount"])
                 await Cache.incr_total_requests(query_default=False, requests=1)
+                await TransactionsDB.fallback_add(datetime_str=data["requestedAt"], amount=message)
                 continue
             except httpx.HTTPStatusError as e:
-                # logging.error(f"[httpx.HTTPStatusError] {e}")
+                logging.error(f"[httpx.HTTPStatusError] FALLBACK Error 500 -- lost message")
                 payment_processor_health.fallback_failing = True
             except Exception as e:
                 logging.error(f"[Exception] {e}")
@@ -204,6 +244,7 @@ async def task_worker(idx: int):
 
         # Se ambos estão fora do ar, espera um pouco
         await asyncio.sleep(2)
+        logging.warning(f"both payment processors are failing -- sleeping for while")
 
 
 @asynccontextmanager
@@ -259,6 +300,7 @@ async def read_root():
 class Payment(BaseModel):
     amount: float
     correlationId: str
+    requestedAt: str | None = None
 
 
 @app.post("/payments")
@@ -271,6 +313,7 @@ async def create_payment(payment: Payment):
         "amount": 19.90
     }
     """
+    payment.requestedAt = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     await Queue.push(payment.model_dump_json())
     await redis_client.incr("request_count")
     return {
@@ -298,13 +341,24 @@ async def payments_summary(request: Request):
     """
     params = dict(request.query_params)
     logging.warning(f"summary params {params}")
+    # if "from" in params and "to" in params:
+
+    default_requests, default_amount = await TransactionsDB.default_summary(
+        start_datetime_str=params["from"],
+        end_datetime_str=params["to"]
+    )
+
+    fallback_requests, fallback_amount = await TransactionsDB.fallback_summary(
+        start_datetime_str=params["from"],
+        end_datetime_str=params["to"]
+    )
     return {
         "default" : {
-            "totalAmount": await Cache.get_total_amount(query_default=True),
-            "totalRequests": await Cache.get_total_requests(query_default=True),
+            "totalAmount": default_amount, # await Cache.get_total_amount(query_default=True),
+            "totalRequests": default_requests, # await Cache.get_total_requests(query_default=True),
         },
         "fallback" : {
-            "totalAmount": await Cache.get_total_amount(query_default=False),
-            "totalRequests": await Cache.get_total_requests(query_default=False),
-        }
+            "totalAmount": fallback_amount, # await Cache.get_total_amount(query_default=False),
+            "totalRequests": fallback_requests, # await Cache.get_total_requests(query_default=False),
+        },
     }
