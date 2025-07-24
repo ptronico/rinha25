@@ -267,7 +267,7 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(check_service_health(query_default=True))
     asyncio.create_task(check_service_health(query_default=False))
-    for idx in range(4):
+    for idx in range(1000):
         asyncio.create_task(task_worker(idx))
     logging.warning("ONSTART")
 
