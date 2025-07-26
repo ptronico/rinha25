@@ -1,24 +1,19 @@
-import os
-import json
-import time
-import httpx
 import asyncio
+import json
 import logging
-import redis.asyncio as redis
-from datetime import datetime, timezone
+import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Type
+
+import httpx
+import redis.asyncio as redis
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
-from typing import Type
 
 from .connection_manager import HttpClient
 
-
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
 class PaymentProcessorHealth:
@@ -50,11 +45,9 @@ class PaymentProcessorHealth:
 
 
 redis_client: redis.Redis = None
-
 default_http_client: Type[HttpClient] = HttpClient(base_url="http://payment-processor-default:8080", name="DEFAULT")
 fallback_http_client: Type[HttpClient] = HttpClient(base_url="http://payment-processor-fallback:8080", name="FALLBACK")
 payment_processor_health: Type[PaymentProcessorHealth] = PaymentProcessorHealth()
-
 
 
 class TransactionsDB:
@@ -100,7 +93,6 @@ class TransactionsDB:
         return (n, n * 19.9)
 
 
-
 class Queue:
     name = "default"
 
@@ -112,32 +104,6 @@ class Queue:
     async def pop(cls):
         _, message = await redis_client.blpop(cls.name)
         return message.decode()
-
-
-# class PaymentGateway:
-#     default = "http://payment-processor-default:8080"
-#     fallback = "http://payment-processor-fallback:8080"
-
-#     @classmethod
-#     async def service_health(cls, query_default: bool = True) -> dict:
-#         gateway = cls.default if query_default else cls.fallback
-#         async with httpx.AsyncClient() as client:
-#             url = f"{gateway}/payments/service-health"
-#             response: httpx.Response = await client.get(url)
-#             return response.json()
-
-#     @classmethod
-#     async def pay(cls, data: dict, query_default: bool = True) -> bool:
-#         """
-#         NOTE: Esse método abre uma nova conexão a cada pagamento.
-#         Um método mais eficiente utilizaria a mesma conexão para fazer diversos pagamentos.
-#         """
-#         # gateway = cls.default if query_default else cls.fallback
-#         # async with httpx.AsyncClient(timeout=3) as client:
-#         #     url = f"{gateway}/payments"
-#         #     response: httpx.Response = await client.post(url, json=data)
-#         #     return response.json()
-#         return await default_http_client.post(endpoint="/payments", payload=data)
 
 
 async def check_service_health(query_default: bool = True, interval_seconds: int = 5):
@@ -152,7 +118,7 @@ async def check_service_health(query_default: bool = True, interval_seconds: int
                 payment_processor_health.default_failing = health["failing"]
             else:
                 payment_processor_health.fallback_failing = health["failing"]
-        except Exception as exc:
+        except Exception:
             logging.warning(f"query_default: {query_default} | Error")
         await asyncio.sleep(interval_seconds)
 
@@ -164,11 +130,11 @@ async def task_worker(idx: int):
         data = json.loads(message)
         if not payment_processor_health.default_failing:
             try:
-                response = await default_http_client.post(endpoint="/payments", payload=data)
+                await default_http_client.post(endpoint="/payments", payload=data)
                 await TransactionsDB.default_add(datetime_str=data["requestedAt"], amount=message)
                 continue
-            except httpx.HTTPStatusError as e:
-                logging.error(f"[httpx.HTTPStatusError] DEFAULT Error 500 -- lost message")
+            except httpx.HTTPStatusError:
+                logging.error("[httpx.HTTPStatusError] DEFAULT Error 500 -- lost message")
                 payment_processor_health.default_failing = True
             except Exception as e:
                 logging.error(f"[Exception] {e}")
@@ -177,11 +143,11 @@ async def task_worker(idx: int):
 
         if not payment_processor_health.fallback_failing:
             try:
-                response = await fallback_http_client.post(endpoint="/payments", payload=data)
+                await fallback_http_client.post(endpoint="/payments", payload=data)
                 await TransactionsDB.fallback_add(datetime_str=data["requestedAt"], amount=message)
                 continue
             except httpx.HTTPStatusError as e:
-                logging.error(f"[httpx.HTTPStatusError] FALLBACK Error 500 -- lost message")
+                logging.error("[httpx.HTTPStatusError] FALLBACK Error 500 -- lost message")
                 payment_processor_health.fallback_failing = True
             except Exception as e:
                 logging.error(f"[Exception] {e}")
@@ -190,17 +156,13 @@ async def task_worker(idx: int):
 
         # Se ambos estão fora do ar, espera um pouco
         await asyncio.sleep(2)
-        logging.warning(f"both payment processors are failing -- sleeping for while")
+        logging.warning("both payment processors are failing -- sleeping for while")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis_client
-
-    redis_client = redis.Redis(
-        host=os.environ["REDIS_HOST"],
-        port=int(os.environ["REDIS_PORT"])
-    )
+    redis_client = redis.Redis(host=os.environ["REDIS_HOST"], port=int(os.environ["REDIS_PORT"]))
     await redis_client.ping()
     await redis_client.flushall()
 
@@ -218,21 +180,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
-
-@app.get("/ping")
-async def read_root():
-    return {"ping": "pong"}
-
-
-@app.get("/info")
-async def read_root():
-    message = {"time": time.time()}
-    item = await Queue.push(json.dumps(message))
-    return {
-        "code": "1",
-        "instance": os.environ.get("INSTANCE_ID", None),
-    }
 
 
 class Payment(BaseModel):
@@ -253,10 +200,7 @@ async def create_payment(payment: Payment):
     """
     payment.requestedAt = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     await Queue.push(payment.model_dump_json())
-    return {
-        "queued": True,
-        "instance": os.environ.get("INSTANCE_ID", None)
-    }
+    return {"queued": True, "instance": os.environ.get("INSTANCE_ID", None)}
 
 
 @app.get("/payments-summary")
@@ -278,23 +222,37 @@ async def payments_summary(request: Request):
     """
     params = dict(request.query_params)
     logging.warning(f"summary params {params}")
-
     default_requests, default_amount = await TransactionsDB.default_summary(
         start_datetime_str=params["from"],
-        end_datetime_str=params["to"]
+        end_datetime_str=params["to"],
     )
-
     fallback_requests, fallback_amount = await TransactionsDB.fallback_summary(
         start_datetime_str=params["from"],
-        end_datetime_str=params["to"]
+        end_datetime_str=params["to"],
     )
     return {
-        "default" : {
+        "default": {
             "totalAmount": default_amount,
             "totalRequests": default_requests,
         },
-        "fallback" : {
+        "fallback": {
             "totalAmount": fallback_amount,
             "totalRequests": fallback_requests,
         },
+    }
+
+
+@app.get("/ping")
+async def ping_controller():
+    return {
+        "ping": "pong",
+        "instance": os.environ.get("INSTANCE_ID", None),
+    }
+
+
+@app.post("/flushall")
+async def flushall_controller():
+    await redis_client.flushall()
+    return {
+        "flushall": True,
     }

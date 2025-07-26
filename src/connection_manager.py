@@ -1,5 +1,6 @@
-import httpx
 import logging
+
+import httpx
 
 
 class HttpClient:
@@ -42,8 +43,7 @@ class HttpClient:
             response = await self.client.get(f"{self.base_url}{endpoint}")
             response.raise_for_status()
             return response.json()
-        except httpx.RequestError as e:
-            # logging.error(f"[httpx.RequestError] {e}")
+        except httpx.RequestError:
             if not retry:
                 await self.reconnect()
                 return await self.get(endpoint, retry=True)
@@ -55,8 +55,7 @@ class HttpClient:
             response = await self.client.post(f"{self.base_url}{endpoint}", json=payload)
             response.raise_for_status()
             return response.json()
-        except httpx.RequestError as e:
-            # logging.error(f"[httpx.RequestError] {e}")
+        except httpx.RequestError:
             if not retry:
                 await self.reconnect()
                 return await self.posts(endpoint, payload, retry=True)
