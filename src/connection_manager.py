@@ -13,10 +13,10 @@ class HttpClient:
             self.client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=httpx.Timeout(
-                    connect=15.0,
-                    read=15.0,
-                    write=15.0,
-                    pool=15.0,
+                    connect=5.0,
+                    read=5.0,
+                    write=5.0,
+                    pool=5.0,
                 ),
                 # TODO: entender melhor como esses parâmetros afetam o sistema
                 limits=httpx.Limits(

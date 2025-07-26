@@ -56,6 +56,7 @@ fallback_http_client: Type[HttpClient] = HttpClient(base_url="http://payment-pro
 payment_processor_health: Type[PaymentProcessorHealth] = PaymentProcessorHealth()
 
 
+
 class TransactionsDB:
     _default_db_name = "dtxs"
     _fallback_db_name = "ftxs"
@@ -99,52 +100,6 @@ class TransactionsDB:
         return (n, n * 19.9)
 
 
-class Cache:
-    @classmethod
-    def _gateway_failing_key(cls, query_default: bool) -> str:
-        return f"gateway:failign:default" if query_default else f"gateway:failign:fallback"
-
-    @classmethod
-    def _gateway_total_amount_key(cls, query_default: bool) -> str:
-        return f"gateway:total-amount:default" if query_default else f"gateway:total-amount:fallback"
-
-    @classmethod
-    def _gateway_total_requests_key(cls, query_default: bool) -> str:
-        return f"gateway:total-requests:default" if query_default else f"gateway:total-requests:fallback"
-
-    @classmethod
-    async def get_gateway_failing(cls, query_default: bool) -> bool:
-        return "true" == await redis_client.get(cls._gateway_failing_key(query_default))
-
-    @classmethod
-    async def set_gateway_failing(cls, query_default: bool, failing: bool) -> None:
-        await redis_client.set(cls._gateway_failing_key(query_default), "true" if failing else "false")
-
-    @classmethod
-    async def get_total_amount(cls, query_default: bool) -> bool:
-        return float(await redis_client.get(cls._gateway_total_amount_key(query_default)))
-
-    @classmethod
-    async def set_total_amount(cls, query_default: bool, amount: float) -> bool:
-        await redis_client.set(cls._gateway_total_amount_key(query_default), str(amount))
-
-    @classmethod
-    async def incr_total_amount(cls, query_default: bool, amount: float) -> bool:
-        curr_amount = await cls.get_total_amount(query_default)
-        return float(await redis_client.set(cls._gateway_total_amount_key(query_default), str(curr_amount + amount)))
-
-    @classmethod
-    async def get_total_requests(cls, query_default: bool) -> bool:
-        return int(await redis_client.get(cls._gateway_total_requests_key(query_default)))
-
-    @classmethod
-    async def set_total_requests(cls, query_default: bool, requests: int) -> bool:
-        return int(await redis_client.set(cls._gateway_total_requests_key(query_default), str(requests)))
-
-    @classmethod
-    async def incr_total_requests(cls, query_default: bool, requests: int) -> bool:
-        await redis_client.incr(cls._gateway_total_requests_key(query_default), requests)
-
 
 class Queue:
     name = "default"
@@ -159,36 +114,35 @@ class Queue:
         return message.decode()
 
 
-class PaymentGateway:
-    default = "http://payment-processor-default:8080"
-    fallback = "http://payment-processor-fallback:8080"
+# class PaymentGateway:
+#     default = "http://payment-processor-default:8080"
+#     fallback = "http://payment-processor-fallback:8080"
 
-    @classmethod
-    async def service_health(cls, query_default: bool = True) -> dict:
-        gateway = cls.default if query_default else cls.fallback
-        async with httpx.AsyncClient() as client:
-            url = f"{gateway}/payments/service-health"
-            response: httpx.Response = await client.get(url)
-            return response.json()
+#     @classmethod
+#     async def service_health(cls, query_default: bool = True) -> dict:
+#         gateway = cls.default if query_default else cls.fallback
+#         async with httpx.AsyncClient() as client:
+#             url = f"{gateway}/payments/service-health"
+#             response: httpx.Response = await client.get(url)
+#             return response.json()
 
-    @classmethod
-    async def pay(cls, data: dict, query_default: bool = True) -> bool:
-        """
-        NOTE: Esse método abre uma nova conexão a cada pagamento.
-        Um método mais eficiente utilizaria a mesma conexão para fazer diversos pagamentos.
-        """
-        # gateway = cls.default if query_default else cls.fallback
-        # async with httpx.AsyncClient(timeout=3) as client:
-        #     url = f"{gateway}/payments"
-        #     response: httpx.Response = await client.post(url, json=data)
-        #     return response.json()
-        return await default_http_client.post(endpoint="/payments", payload=data)
+#     @classmethod
+#     async def pay(cls, data: dict, query_default: bool = True) -> bool:
+#         """
+#         NOTE: Esse método abre uma nova conexão a cada pagamento.
+#         Um método mais eficiente utilizaria a mesma conexão para fazer diversos pagamentos.
+#         """
+#         # gateway = cls.default if query_default else cls.fallback
+#         # async with httpx.AsyncClient(timeout=3) as client:
+#         #     url = f"{gateway}/payments"
+#         #     response: httpx.Response = await client.post(url, json=data)
+#         #     return response.json()
+#         return await default_http_client.post(endpoint="/payments", payload=data)
 
 
 async def check_service_health(query_default: bool = True, interval_seconds: int = 5):
     while True:
         try:
-            # health: dict = await PaymentGateway.service_health(query_default)
             if query_default:
                 health: dict = await default_http_client.get(endpoint="/payments/service-health")
             else:
@@ -198,12 +152,8 @@ async def check_service_health(query_default: bool = True, interval_seconds: int
                 payment_processor_health.default_failing = health["failing"]
             else:
                 payment_processor_health.fallback_failing = health["failing"]
-
-            await Cache.set_gateway_failing(query_default, health["failing"])
-            # print(f"query_default: {query_default} | failing: {health['failing']} | minResponseTime: {health['minResponseTime']}")
         except Exception as exc:
-            await Cache.set_gateway_failing(query_default, True)
-            print(f"query_default: {query_default} | Error")
+            logging.warning(f"query_default: {query_default} | Error")
         await asyncio.sleep(interval_seconds)
 
 
@@ -215,8 +165,6 @@ async def task_worker(idx: int):
         if not payment_processor_health.default_failing:
             try:
                 response = await default_http_client.post(endpoint="/payments", payload=data)
-                await Cache.incr_total_amount(query_default=True, amount=data["amount"])
-                await Cache.incr_total_requests(query_default=True, requests=1)
                 await TransactionsDB.default_add(datetime_str=data["requestedAt"], amount=message)
                 continue
             except httpx.HTTPStatusError as e:
@@ -230,8 +178,6 @@ async def task_worker(idx: int):
         if not payment_processor_health.fallback_failing:
             try:
                 response = await fallback_http_client.post(endpoint="/payments", payload=data)
-                await Cache.incr_total_amount(query_default=False, amount=data["amount"])
-                await Cache.incr_total_requests(query_default=False, requests=1)
                 await TransactionsDB.fallback_add(datetime_str=data["requestedAt"], amount=message)
                 continue
             except httpx.HTTPStatusError as e:
@@ -258,16 +204,9 @@ async def lifespan(app: FastAPI):
     await redis_client.ping()
     await redis_client.flushall()
 
-    if not await redis_client.exists("request_count"):
-        await redis_client.set("request_count", 0)
-    for query_default in [True, False]:
-        await Cache.set_total_amount(query_default=query_default, amount=0)
-        await Cache.set_total_requests(query_default=query_default, requests=0)
-        await Cache.set_gateway_failing(query_default=query_default, failing=True)
-
     asyncio.create_task(check_service_health(query_default=True))
     asyncio.create_task(check_service_health(query_default=False))
-    for idx in range(1000):
+    for idx in range(100):
         asyncio.create_task(task_worker(idx))
     logging.warning("ONSTART")
 
@@ -293,7 +232,6 @@ async def read_root():
     return {
         "code": "1",
         "instance": os.environ.get("INSTANCE_ID", None),
-        "request_count": int(await redis_client.get("request_count")),
     }
 
 
@@ -315,7 +253,6 @@ async def create_payment(payment: Payment):
     """
     payment.requestedAt = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     await Queue.push(payment.model_dump_json())
-    await redis_client.incr("request_count")
     return {
         "queued": True,
         "instance": os.environ.get("INSTANCE_ID", None)
@@ -341,7 +278,6 @@ async def payments_summary(request: Request):
     """
     params = dict(request.query_params)
     logging.warning(f"summary params {params}")
-    # if "from" in params and "to" in params:
 
     default_requests, default_amount = await TransactionsDB.default_summary(
         start_datetime_str=params["from"],
@@ -354,11 +290,11 @@ async def payments_summary(request: Request):
     )
     return {
         "default" : {
-            "totalAmount": default_amount, # await Cache.get_total_amount(query_default=True),
-            "totalRequests": default_requests, # await Cache.get_total_requests(query_default=True),
+            "totalAmount": default_amount,
+            "totalRequests": default_requests,
         },
         "fallback" : {
-            "totalAmount": fallback_amount, # await Cache.get_total_amount(query_default=False),
-            "totalRequests": fallback_requests, # await Cache.get_total_requests(query_default=False),
+            "totalAmount": fallback_amount,
+            "totalRequests": fallback_requests,
         },
     }
