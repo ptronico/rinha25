@@ -2,11 +2,10 @@ import asyncio
 import json
 import logging
 import os
-import time
 import socket
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Type
 
 import httpx
 import redis.asyncio as redis
@@ -14,7 +13,6 @@ from fastapi import BackgroundTasks, FastAPI, Request, Response
 from pydantic import BaseModel
 
 from .connection_manager import HttpClient
-
 
 hostname = socket.gethostname()
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -38,7 +36,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(check_service_health(query_default=True))
     asyncio.create_task(check_service_health(query_default=False))
 
-    for idx in range(100):
+    for idx in range(30):
         asyncio.create_task(task_worker(idx))
 
     logging.warning("ONSTART")
