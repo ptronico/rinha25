@@ -14,16 +14,16 @@ class HttpClient:
             self.client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=httpx.Timeout(
-                    connect=5.0,
-                    read=5.0,
-                    write=5.0,
-                    pool=5.0,
+                    connect=30.0,
+                    read=30.0,
+                    write=30.0,
+                    pool=30.0,
                 ),
                 # TODO: entender melhor como esses parâmetros afetam o sistema
                 limits=httpx.Limits(
                     max_connections=50,
                     max_keepalive_connections=20,
-                    keepalive_expiry=5.0,
+                    keepalive_expiry=20.0,
                 ),
             )
             logging.warning(f"[HttpClient] {self.name} connected")
@@ -58,5 +58,5 @@ class HttpClient:
         except httpx.RequestError:
             if not retry:
                 await self.reconnect()
-                return await self.posts(endpoint, payload, retry=True)
+                return await self.post(endpoint, payload, retry=True)
             raise
