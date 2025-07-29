@@ -2,13 +2,14 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Type
 
 import httpx
 import redis.asyncio as redis
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from pydantic import BaseModel
 
 from .connection_manager import HttpClient
@@ -146,7 +147,7 @@ async def task_worker(idx: int):
                 await fallback_http_client.post(endpoint="/payments", payload=data)
                 await TransactionsDB.fallback_add(datetime_str=data["requestedAt"], amount=message)
                 continue
-            except httpx.HTTPStatusError as e:
+            except httpx.HTTPStatusError:
                 logging.error("[httpx.HTTPStatusError] FALLBACK Error 500 -- lost message")
                 payment_processor_health.fallback_failing = True
             except Exception as e:
@@ -154,9 +155,12 @@ async def task_worker(idx: int):
                 payment_processor_health.fallback_failing = True
                 raise
 
-        # Se ambos estão fora do ar, espera um pouco
-        await asyncio.sleep(2)
-        logging.warning("both payment processors are failing -- sleeping for while")
+        # Se a mensagem não foi processada com sucesso, adiciona ela novamente ao final da fila
+        await Queue.push(message)
+
+        # Se ambos estão fora do ar, espera um pouco até tentar novamente
+        await asyncio.sleep(3)
+        # logging.warning("both payment processors are failing -- sleeping for while")
 
 
 @asynccontextmanager
@@ -168,7 +172,8 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(check_service_health(query_default=True))
     asyncio.create_task(check_service_health(query_default=False))
-    for idx in range(100):
+
+    for idx in range(2000):
         asyncio.create_task(task_worker(idx))
     logging.warning("ONSTART")
 
@@ -200,7 +205,7 @@ async def create_payment(payment: Payment):
     """
     payment.requestedAt = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     await Queue.push(payment.model_dump_json())
-    return {"queued": True, "instance": os.environ.get("INSTANCE_ID", None)}
+    return Response(status_code=202)
 
 
 @app.get("/payments-summary")
@@ -221,7 +226,7 @@ async def payments_summary(request: Request):
     }
     """
     params = dict(request.query_params)
-    logging.warning(f"summary params {params}")
+    t0 = time.monotonic()
     default_requests, default_amount = await TransactionsDB.default_summary(
         start_datetime_str=params["from"],
         end_datetime_str=params["to"],
@@ -230,6 +235,8 @@ async def payments_summary(request: Request):
         start_datetime_str=params["from"],
         end_datetime_str=params["to"],
     )
+    tf = time.monotonic()
+    logging.warning(f"summary params {params} {tf-t0}")
     return {
         "default": {
             "totalAmount": default_amount,
@@ -245,7 +252,6 @@ async def payments_summary(request: Request):
 @app.get("/ping")
 async def ping_controller():
     return {
-        "ping": "pong",
         "instance": os.environ.get("INSTANCE_ID", None),
     }
 
