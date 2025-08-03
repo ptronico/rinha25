@@ -13,18 +13,8 @@ class HttpClient:
         if self.client is None or self.client.is_closed:
             self.client = httpx.AsyncClient(
                 base_url=self.base_url,
-                timeout=httpx.Timeout(
-                    connect=30.0,
-                    read=30.0,
-                    write=30.0,
-                    pool=30.0,
-                ),
-                # TODO: entender melhor como esses parâmetros afetam o sistema
-                limits=httpx.Limits(
-                    max_connections=50,
-                    max_keepalive_connections=20,
-                    keepalive_expiry=20.0,
-                ),
+                timeout=httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0),
+                limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=20.0),
             )
             logging.warning(f"[HttpClient] {self.name} connected")
 

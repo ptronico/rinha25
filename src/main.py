@@ -1,13 +1,14 @@
 import asyncio
-import json
 import logging
 import os
+import random
 import socket
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import httpx
+import orjson
 import redis.asyncio as redis
 from fastapi import BackgroundTasks, FastAPI, Request, Response
 from pydantic import BaseModel
@@ -27,17 +28,21 @@ async def lifespan(app: FastAPI):
     redis_host = os.environ["REDIS_HOST"]
     redis_port = int(os.environ["REDIS_PORT"])
 
+    app.state.default_num_sem = 15
+    app.state.fallback_num_sem = 3
+
+    app.state.default_semaphore = asyncio.Semaphore(app.state.default_num_sem)
+    app.state.fallback_semaphore = asyncio.Semaphore(app.state.fallback_num_sem)
+
     app.state.redis_async_pool = redis.ConnectionPool(host=redis_host, port=redis_port)
     app.state.redis = redis.Redis.from_pool(app.state.redis_async_pool)
 
     await app.state.redis.ping()
     await app.state.redis.flushall()
 
-    asyncio.create_task(check_service_health(query_default=True))
-    asyncio.create_task(check_service_health(query_default=False))
-
-    for idx in range(30):
-        asyncio.create_task(task_worker(idx))
+    # asyncio.create_task(check_service_health(query_default=True))
+    # asyncio.create_task(check_service_health(query_default=False))
+    asyncio.create_task(task_worker(1))
 
     logging.warning("ONSTART")
 
@@ -65,7 +70,9 @@ class PaymentProcessorHealth:
     def default_failing(self, is_failing: bool):
         if is_failing != self._default_failing:
             message = "FAILING" if is_failing else "WORKING"
-            logging.warning(f"DEFAULT payment processor is {message}")
+            num_sem = 0 if is_failing else app.state.default_num_sem
+            logging.warning(f"DEFAULT payment processor is {message} | sem: {num_sem}")
+            # app.state.default_semaphore = asyncio.Semaphore(num_sem)
         self._default_failing = is_failing
 
     @property
@@ -76,7 +83,9 @@ class PaymentProcessorHealth:
     def fallback_failing(self, is_failing: bool):
         if is_failing != self._fallback_failing:
             message = "FAILING" if is_failing else "WORKING"
-            logging.warning(f"FALLBACK payment processor is {message}")
+            num_sem = 0 if is_failing else app.state.fallback_num_sem
+            logging.warning(f"FALLBACK payment processor is {message} | sem: {num_sem}")
+            # app.state.fallback_semaphore = asyncio.Semaphore(num_sem)
         self._fallback_failing = is_failing
 
 
@@ -128,16 +137,29 @@ class Queue:
 
     @classmethod
     async def push(cls, message):
-        await app.state.redis.rpush(cls.name, message)
+        r: redis.Redis = app.state.redis
+        await r.rpush(cls.name, message)
 
     @classmethod
     async def re_push(cls, message):
-        await app.state.redis.lpush(cls.name, message)
+        r: redis.Redis = app.state.redis
+        await r.lpush(cls.name, message)
 
     @classmethod
     async def pop(cls):
-        _, message = await app.state.redis.blpop(cls.name)
+        r: redis.Redis = app.state.redis
+        _, message = await r.blpop(cls.name)
         return message.decode()
+
+    @classmethod
+    async def pop_many(cls, count=None):
+        r: redis.Redis = app.state.redis
+        messages = await r.lpop(cls.name, count)
+        if isinstance(messages, str):
+            return [messages.decode()]
+        if messages is not None:
+            return [m.decode() for m in messages]
+        return []
 
 
 async def check_service_health(query_default: bool = True, interval_seconds: int = 5):
@@ -157,42 +179,42 @@ async def check_service_health(query_default: bool = True, interval_seconds: int
         await asyncio.sleep(interval_seconds)
 
 
+async def process_payment(data, message):
+    async with app.state.default_semaphore:
+        try:
+            await app.state.default_http_client.post(endpoint="/payments", payload=data)
+            await TransactionsDB.default_add(datetime_str=data["requestedAt"], amount=message)
+            # app.state.default_semaphore = asyncio.Semaphore(app.state.default_num_sem)
+        except httpx.HTTPStatusError:
+            # app.state.default_semaphore = asyncio.Semaphore(1)
+            # await process_payment_fallback(data, message)
+            await Queue.re_push(message)
+        except Exception:
+            raise
+
+
+async def process_payment_fallback(data, message):
+    async with app.state.fallback_semaphore:
+        try:
+            await app.state.fallback_http_client.post(endpoint="/payments", payload=data)
+            await TransactionsDB.fallback_add(datetime_str=data["requestedAt"], amount=message)
+        except httpx.HTTPStatusError:
+            await Queue.re_push(message)
+        except Exception:
+            raise
+
+
 async def task_worker(idx: int):
     # logging.warning(f"Starting queue {idx}")
     while True:
-        message = await Queue.pop()
-        data = json.loads(message)
-        if not app.state.payment_processor_health.default_failing:
-            try:
-                await app.state.default_http_client.post(endpoint="/payments", payload=data)
-                await TransactionsDB.default_add(datetime_str=data["requestedAt"], amount=message)
-                continue
-            except httpx.HTTPStatusError:
-                # logging.error("[httpx.HTTPStatusError] DEFAULT Error 500 -- lost message")
-                app.state.payment_processor_health.default_failing = True
-            except Exception as e:
-                logging.error(f"[Exception] {e}")
-                app.state.payment_processor_health.default_failing = True
-                raise
-
-        if not app.state.payment_processor_health.fallback_failing:
-            try:
-                await app.state.fallback_http_client.post(endpoint="/payments", payload=data)
-                await TransactionsDB.fallback_add(datetime_str=data["requestedAt"], amount=message)
-                continue
-            except httpx.HTTPStatusError:
-                # logging.error("[httpx.HTTPStatusError] FALLBACK Error 500 -- lost message")
-                app.state.payment_processor_health.fallback_failing = True
-            except Exception as e:
-                logging.error(f"[Exception] {e}")
-                app.state.payment_processor_health.fallback_failing = True
-                raise
-
-        # Se a mensagem não foi processada com sucesso, adiciona ela novamente ao final da fila
-        await Queue.re_push(message)
-        # Se ambos estão fora do ar, espera um pouco até tentar novamente
-        await asyncio.sleep(3)
-        # logging.warning("both payment processors are failing -- sleeping for while")
+        # messages = [await Queue.pop()]
+        messages = await Queue.pop_many(count=20)
+        for message in messages:
+            data = orjson.loads(message)
+            if random.random() > 0.5:
+                asyncio.create_task(process_payment(data, message=message))
+            else:
+                asyncio.create_task(process_payment_fallback(data, message=message))
 
 
 class Payment(BaseModel):
@@ -240,6 +262,9 @@ async def payments_summary(request: Request):
     }
     """
     params = dict(request.query_params)
+    # messages = await Queue.pop_many(count=10)
+    # logging.warning(messages)
+    # await asyncio.sleep(0.75)
     t0 = time.monotonic()
     default_requests, default_amount = await TransactionsDB.default_summary(
         start_datetime_str=params["from"],
@@ -250,7 +275,8 @@ async def payments_summary(request: Request):
         end_datetime_str=params["to"],
     )
     tf = time.monotonic()
-    logging.warning(f"summary params {params} {default_requests} {fallback_requests} {tf - t0}")
+    delta_milis = int(1000 * (tf - t0))
+    logging.warning(f"summary params {params} {delta_milis}ms | {default_requests} {fallback_requests}")
     return {
         "default": {
             "totalAmount": default_amount,
@@ -259,6 +285,10 @@ async def payments_summary(request: Request):
         "fallback": {
             "totalAmount": fallback_amount,
             "totalRequests": fallback_requests,
+        },
+        "total": {
+            "totalAmount": default_amount + fallback_amount,
+            "totalRequests": default_requests + fallback_requests,
         },
     }
 
