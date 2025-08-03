@@ -21,14 +21,20 @@ logging.basicConfig(level=logging.WARNING, format="%(asctime)s [%(levelname)s] %
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.default_http_client = HttpClient(base_url="http://payment-processor-default:8080", name="DEFAULT")
-    app.state.fallback_http_client = HttpClient(base_url="http://payment-processor-fallback:8080", name="FALLBACK")
+    app.state.default_http_client = HttpClient(
+        base_url=os.environ["PROCESSOR_DEFAULT_URL"],
+        name="DEFAULT",
+    )
+    app.state.fallback_http_client = HttpClient(
+        base_url=os.environ["PROCESSOR_FALLBACK_URL"],
+        name="FALLBACK",
+    )
     app.state.payment_processor_health = PaymentProcessorHealth()
 
     redis_host = os.environ["REDIS_HOST"]
     redis_port = int(os.environ["REDIS_PORT"])
 
-    app.state.default_num_sem = 15
+    app.state.default_num_sem = 10
     app.state.fallback_num_sem = 3
 
     app.state.default_semaphore = asyncio.Semaphore(app.state.default_num_sem)
@@ -54,7 +60,12 @@ async def lifespan(app: FastAPI):
     logging.warning("ONSHUTDOWN")
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    docs_url=None,
+    lifespan=lifespan,
+    openapi_url=None,
+    redoc_url=None,
+)
 
 
 class PaymentProcessorHealth:
@@ -105,7 +116,10 @@ class TransactionsDB:
 
     @classmethod
     async def default_add(cls, datetime_str: str, amount: str):
-        await app.state.redis.zadd(cls._default_db_name, {amount: cls._datetime_str_to_number(datetime_str)})
+        await app.state.redis.zadd(
+            cls._default_db_name,
+            {amount: cls._datetime_str_to_number(datetime_str)},
+        )
 
     @classmethod
     async def default_summary(cls, start_datetime_str: str, end_datetime_str: str):
@@ -119,7 +133,10 @@ class TransactionsDB:
 
     @classmethod
     async def fallback_add(cls, datetime_str: str, amount: str):
-        await app.state.redis.zadd(cls._fallback_db_name, {amount: cls._datetime_str_to_number(datetime_str)})
+        await app.state.redis.zadd(
+            cls._fallback_db_name,
+            {amount: cls._datetime_str_to_number(datetime_str)},
+        )
 
     @classmethod
     async def fallback_summary(cls, start_datetime_str: str, end_datetime_str: str):
@@ -166,9 +183,13 @@ async def check_service_health(query_default: bool = True, interval_seconds: int
     while True:
         try:
             if query_default:
-                health: dict = await app.state.default_http_client.get(endpoint="/payments/service-health")
+                health: dict = await app.state.default_http_client.get(
+                    endpoint="/payments/service-health",
+                )
             else:
-                health: dict = await app.state.fallback_http_client.get(endpoint="/payments/service-health")
+                health: dict = await app.state.fallback_http_client.get(
+                    endpoint="/payments/service-health",
+                )
 
             if query_default:
                 app.state.payment_processor_health.default_failing = health["failing"]
@@ -179,8 +200,9 @@ async def check_service_health(query_default: bool = True, interval_seconds: int
         await asyncio.sleep(interval_seconds)
 
 
-async def process_payment(data, message):
+async def process_payment(message):
     async with app.state.default_semaphore:
+        data = orjson.loads(message)
         try:
             await app.state.default_http_client.post(endpoint="/payments", payload=data)
             await TransactionsDB.default_add(datetime_str=data["requestedAt"], amount=message)
@@ -210,11 +232,12 @@ async def task_worker(idx: int):
         # messages = [await Queue.pop()]
         messages = await Queue.pop_many(count=20)
         for message in messages:
-            data = orjson.loads(message)
-            if random.random() > 0.5:
-                asyncio.create_task(process_payment(data, message=message))
-            else:
-                asyncio.create_task(process_payment_fallback(data, message=message))
+            # data = orjson.loads(message)
+            asyncio.create_task(process_payment(message=message))
+            # if random.random() > 0.9:
+            #     asyncio.create_task(process_payment(data, message=message))
+            # else:
+            #     asyncio.create_task(process_payment_fallback(data, message=message))
 
 
 class Payment(BaseModel):
