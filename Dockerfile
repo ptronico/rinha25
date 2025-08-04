@@ -39,5 +39,7 @@ ENTRYPOINT []
 # Uses `fastapi dev` to enable hot-reloading when the `watch` sync occurs
 # Uses `--host 0.0.0.0` to allow access from outside the container
 # CMD ["fastapi", "dev", "--host", "0.0.0.0", "--reload", "api.py"]
-CMD ["uvicorn", "src:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--workers", "1", "--loop", "uvloop", "--http", "httptools"]
+# CMD ["uvicorn", "src:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--workers", "1", "--loop", "uvloop", "--http", "httptools"]
+# CMD ["uvicorn", "src:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--workers", "1", "--loop", "uvloop", "--http", "httptools", "--uds", "/shared/backend.sock"]
 # CMD ["uvicorn", "src:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--no-access-log", "--workers", "1"]
+# CMD ["uvicorn", "src:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log", "--workers", "1"]
